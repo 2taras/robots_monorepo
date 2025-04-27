@@ -11,49 +11,6 @@ volatile long encR = 0;
 
 Octoliner octoliner;
 
-// --- Калибровка и нормализация датчиков
-int octo_min[8] = {1023,1023,1023,1023,1023,1023,1023,1023};
-int octo_max[8] = {0,0,0,0,0,0,0,0};
-
-float sensor_position[8] = {-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5}; // слева - справа
-
-void octoliner_calibrate(int scans=200) {
-  for(int i=0; i<scans; i++) {
-    for(int j=0; j<8; j++) {
-      int v = octoliner.analogRead(j);
-      if(v < octo_min[j]) octo_min[j] = v;
-      if(v > octo_max[j]) octo_max[j] = v;
-    }
-    delay(3);
-  }
-  Serial.println("Octoliner calibration done.");
-  for(int i=0;i<8;i++) {
-    Serial.print("min["); Serial.print(i); Serial.print("]="); Serial.print(octo_min[i]);
-    Serial.print(" max["); Serial.print(i); Serial.print("]="); Serial.print(octo_max[i]); Serial.print("; ");
-  }
-  Serial.println();
-}
-
-float octoNorm(int idx) {
-  int value = octoliner.analogRead(idx);
-  if(octo_max[idx]==octo_min[idx]) return 0;
-  float res = (float)(value - octo_min[idx]) / (octo_max[idx] - octo_min[idx]);
-  if (res < 0) res = 0; 
-  if (res > 1) res = 1;
-  return res;
-}
-
-float line_position() {
-  float numerator = 0, denominator = 0;
-  for (int i = 0; i < 8; i++) {
-    float v = octoNorm(i);
-    numerator += v * sensor_position[i];
-    denominator += v;
-  }
-  if (denominator == 0) return 0; // если не видим линию
-  return numerator / denominator;
-}
-// --- Конец блока калибровки/нормализации -------------
 
 void e_encL() {
   if(digitalRead(2) == digitalRead(9)) {
@@ -109,20 +66,19 @@ void move_cm(int speed_, int dist) {
   }
 }
 
-// --- PID параметры ---
-// !!! Переподбери под новый способ определения ошибки (line_position возвращает в районе [-3.5;+3.5]) !!!
-float Kp = 18.0;   // подбери! значения множителя сильно растут (несколько-десятков)
-float Ki = 0.06;
-float Kd = 26.0;
+// Параметры PID — подбери под свой робот
+float Kp = 0.5;
+float Ki = 0.01;
+float Kd = 1.0;
 
 float last_err = 0;
 float sum_err = 0;
 
-// --- Новый PID по 8 датчикам
 void line(int speed_) {
-  float err = line_position();    // теперь ошибка определена из центра линии по 8 датчикам
+  float err = (octoliner.analogRead(6) - octoliner.analogRead(2));
 
   sum_err += err;
+  
   float d_err = err - last_err;
   last_err = err;
 
@@ -130,7 +86,6 @@ void line(int speed_) {
   
   move_(speed_ - pid, speed_ + pid);
 }
-
 void line_cm(int speed_, int dist) {
   encL = 0;
   encR = 0;
@@ -140,7 +95,7 @@ void line_cm(int speed_, int dist) {
   }
 }
 
-#define LINE_TRASHOLD 0.90 // !!! теперь в нормализованных величинах, НЕ в AnalogRead! (0.9 = 90% "черноты")
+#define LINE_TRASHOLD 960
 // bool is_cross() {
 //   int16_t brightness_value[8];
 //   octoliner.analogReadAll(brightness_value);
@@ -152,7 +107,7 @@ void line_cm(int speed_, int dist) {
 //   return (cnt > 5);
 // }
 bool is_cross() {
-  return (octoNorm(0) > LINE_TRASHOLD || octoNorm(7) > LINE_TRASHOLD);
+  return (octoliner.analogRead(0) > LINE_TRASHOLD || octoliner.analogRead(7) > LINE_TRASHOLD);
 }
 void cross(int n = 1){ 
   unsigned long long point = millis();
@@ -179,6 +134,55 @@ void turn_enc(int angle) {
     }
   }
 }
+void turn_line(int dir) {
+  // Ограничение на угол поворота для страховки (например, 100°)
+  const float max_angle = 100.0;
+  const float TICKS_PER_DEG = 5.35; // как в твоём turn_enc
+  long max_ticks = max_angle * TICKS_PER_DEG;
+
+  // Сброс энкодеров
+  encL = 0;
+  encR = 0;
+
+  // PID переменные (локальные, т.к. для каждого поворота свои)
+  float local_last_err = 0;
+  float local_sum_err = 0;
+
+  // Безопасность: таймаут ~1,5 сек
+  unsigned long start = millis();
+
+  // Крутимся, пока не увидим линию или не выйдем за пределы max_ticks по среднему энкодеру, либо не наступил таймаут
+  while (
+    (
+      (dir == 1 && octoliner.analogRead(6) < LINE_TRASHOLD) || 
+      (dir == 0 && octoliner.analogRead(2) < LINE_TRASHOLD)
+    )
+    &&
+    ( ((abs(encL) + abs(encR))/2) < max_ticks )
+    && (millis() - start < 1500)
+  ) 
+  {
+    float err = (octoliner.analogRead(6) - octoliner.analogRead(2));
+    local_sum_err += err;
+    float d_err = err - local_last_err;
+    local_last_err = err;
+    float pid = Kp * err + Ki * local_sum_err + Kd * d_err;
+
+    int base_speed = 70;
+
+    // крутимся с ПИД-коррекцией
+    if (dir == 1) { // направо
+      move_(base_speed - pid, -base_speed - pid);
+    } else {        // налево
+      move_(-base_speed - pid, base_speed - pid);
+    }
+
+    delay(10);
+  }
+
+  stop_(); // плавная остановка
+}
+
 
 void setup() {
   pinMode(2, INPUT_PULLUP);
@@ -195,21 +199,16 @@ void setup() {
   attachInterrupt(1, e_encR, CHANGE);
 
   Serial.begin(115200);
+
   octoliner.begin();
   octoliner.setSensitivity(200);
-
-  delay(1500);
-  octoliner_calibrate();
-  delay(500);
 }
-
 void printEncSignals() {
   Serial.print(" L_A: "); Serial.print(digitalRead(2));
   Serial.print(" L_B: "); Serial.print(digitalRead(9));
   Serial.print("| R_A: "); Serial.print(digitalRead(3));
   Serial.print(" R_B: "); Serial.println(digitalRead(10));
 }
-
 void printLineVals() {
   Serial.print("OCTO: "); Serial.print(octoliner.analogRead(7));
   Serial.print(" "); Serial.print(octoliner.analogRead(6));
@@ -220,15 +219,8 @@ void printLineVals() {
   Serial.print(" "); Serial.print(octoliner.analogRead(1));
   Serial.print(" "); Serial.println(octoliner.analogRead(0));
 }
-
-void printLineNorm() {
-  Serial.print("NORM: ");
-  for (int i = 0; i < 8; i++) {
-    Serial.print(octoNorm(i), 2); Serial.print(" ");
-  }
-  Serial.print(" | POS: "); Serial.println(line_position(), 2);
-}
-
+// 930-935
+// 1002
 void loop() {
 
   delay(700);
@@ -277,8 +269,7 @@ void loop() {
 
   delay(50000);
 
-  // Для теста раскомментируй:
-  // printLineNorm(); delay(100);
-
+  // printEncSignals();
+  // delay(100);
   delay(10);
 }
