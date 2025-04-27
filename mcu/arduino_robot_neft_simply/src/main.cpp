@@ -232,9 +232,9 @@ void loop() {
   stop_();
   
   line_cm(80, 50);
+  stop_();
   cross(1);
   move_cm(70, 12);
-  line_cm(80, 50);
   cross(1);
   move_cm(70, 12);
   
